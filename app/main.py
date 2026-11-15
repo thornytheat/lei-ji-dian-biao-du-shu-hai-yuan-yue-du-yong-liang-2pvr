@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -14,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import pipeline, proration, readings, seed, settings, store, summary
+from . import pipeline, proration, publish, readings, seed, settings, store, summary
 
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
@@ -63,7 +65,23 @@ def load_data() -> tuple[list[dict], list[dict], list[dict]]:
 
 def cache_key(rows: list[dict], meters: list[dict], changes: list[dict]) -> str:
     span = f"{rows[0]['read_at']}~{rows[-1]['read_at']}" if rows else "empty"
-    return f"{len(rows)}|{len(meters)}|{len(changes)}|{span}|{settings.SEED_VERSION}"
+    digest = hashlib.sha256(
+        json.dumps(
+            [
+                [
+                    row["meter_id"],
+                    row["read_at"].isoformat(),
+                    row["kind"],
+                    row.get("source"),
+                    round(float(row["reading_kwh"]), 3),
+                ]
+                for row in rows
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{len(rows)}|{len(meters)}|{len(changes)}|{span}|{digest}|{settings.SEED_VERSION}"
 
 
 def analyze_all(force: bool = False) -> dict:
@@ -90,9 +108,19 @@ def base_context(request: Request, **extra: Any) -> dict:
         "full_scale": settings.DEFAULT_FULL_SCALE,
         "max_gap_days": settings.MAX_GAP_DAYS,
         "tou_tolerance": settings.TOU_TOLERANCE,
+        "align_days": settings.SOURCE_ALIGN_DAYS,
+        "reading_precision": settings.READING_PRECISION,
     }
     context.update(extra)
     return context
+
+
+def _source_counts(rows: list[dict]) -> dict:
+    counts = {"manual": 0, "auto": 0}
+    for row in rows:
+        source = row.get("source") or readings.DEFAULT_SOURCE
+        counts[source] = counts.get(source, 0) + 1
+    return counts
 
 
 def pipeline_error(exc: pipeline.PipelineError) -> HTTPException:
@@ -100,6 +128,42 @@ def pipeline_error(exc: pipeline.PipelineError) -> HTTPException:
     if exc.details:
         detail = f"{detail}（{exc.details[0]['message']}）"
     return HTTPException(status_code=exc.status, detail=detail)
+
+
+def _ledger_sources(rows: list[dict], selected: list[str]) -> list[dict]:
+    """台账口径里的来源构成（现场抄表 / 自动采集各多少行）。"""
+    counts: dict[str, int] = {}
+    for row in rows:
+        if row["meter_id"] not in selected:
+            continue
+        source = row.get("source") or readings.DEFAULT_SOURCE
+        counts[source] = counts.get(source, 0) + 1
+    return [
+        {
+            "source": source,
+            "label": readings.SOURCE_LABELS.get(source, source),
+            "rows": count,
+        }
+        for source, count in sorted(counts.items())
+    ]
+
+
+def _active_version_view() -> dict | None:
+    with store.session() as conn:
+        store.init_schema(conn)
+        active = store.active_ledger(conn)
+        history = store.ledger_history(conn, limit=10)
+    if not active:
+        return None
+    return {
+        "version_id": active["version_id"],
+        "batch_key": active["batch_key"],
+        "created_at": active["created_at"],
+        "month": active["month"],
+        "run_id": active["run_id"],
+        "month_order": active["month_order"],
+        "history": len(history),
+    }
 
 
 # --------------------------------------------------------------------------- 请求模型
@@ -110,6 +174,15 @@ class RestoreRequest(BaseModel):
     meter_ids: list[str] = Field(default_factory=list)
     full_scale: float | None = None
     max_gap_days: int | None = None
+    align_days: int | None = Field(
+        default=None, ge=0, le=7, description="现场抄表/自动采集同一读数点的最大日期偏差（天）"
+    )
+    reading_precision: float | None = Field(
+        default=None, gt=0, description="两路来源对齐后的读数精度容差（kWh）"
+    )
+    allow_publish: bool = Field(
+        default=True, description="核对通过后是否发布新台账；来源偏差超精度时发布会被拒绝"
+    )
 
 
 # --------------------------------------------------------------------------- 页面
@@ -203,6 +276,8 @@ def workbench(request: Request) -> HTMLResponse:
         events=events,
         ledger_stats=ledger["stats"] if ledger else {},
         monitored=ledger["monitored"] if ledger else [],
+        source_counts=_source_counts(rows),
+        active_version=_active_version_view(),
     )
     return templates.TemplateResponse(request, "workbench.html", context)
 
@@ -228,8 +303,12 @@ def review(request: Request, month: str | None = None) -> HTMLResponse:
     rows, meters, changes = load_data()
     ledger = None
     error = None
+    source = "live"
     try:
-        ledger = analyze_all()
+        ledger, source = ledger_for_export()
+        if source == "live":
+            # 还没有发布版本时，复核页退化为实时还原结果（与导出保持一致）
+            ledger = analyze_all()
     except pipeline.PipelineError as exc:
         error = exc.message
     months = ledger["month_order"] if ledger else []
@@ -237,6 +316,7 @@ def review(request: Request, month: str | None = None) -> HTMLResponse:
     with store.session() as conn:
         runs = store.list_runs(conn, limit=10)
         events = store.list_events(conn, limit=20)
+        versions = store.ledger_history(conn, limit=10)
     context = base_context(
         request,
         page="review",
@@ -250,6 +330,10 @@ def review(request: Request, month: str | None = None) -> HTMLResponse:
         events=events,
         readings_rows=len(rows),
         changes_count=len(changes),
+        source_counts=_source_counts(rows),
+        active_version=_active_version_view(),
+        versions=versions,
+        ledger_source=source,
     )
     return templates.TemplateResponse(request, "review.html", context)
 
@@ -258,16 +342,19 @@ def review(request: Request, month: str | None = None) -> HTMLResponse:
 
 
 @app.post("/api/import/sample")
-def api_import_sample() -> JSONResponse:
+def api_import_sample(include_auto: bool = False) -> JSONResponse:
     with store.session() as conn:
         store.init_schema(conn)
-        sample = seed.load_sample_files()
+        sample = seed.load_sample_files(include_auto=include_auto)
         result = seed.seed(conn, sample=sample, force=True)
         counts = {
             "readings": store.count_readings(conn),
             "meters": len(store.all_meters(conn)),
             "changes": store.count_changes(conn),
         }
+        sources = {}
+        for row in store.all_readings(conn):
+            sources[row["source"]] = sources.get(row["source"], 0) + 1
     analyze_all(force=True)
     return JSONResponse(
         status_code=200,
@@ -277,6 +364,8 @@ def api_import_sample() -> JSONResponse:
             "reason": result["reason"],
             "stats": sample["stats"],
             "counts": counts,
+            "sources": sources,
+            "include_auto": include_auto,
             "source": settings.SEED_SOURCE,
         },
     )
@@ -366,13 +455,78 @@ def api_restore(payload: RestoreRequest = Body(...)) -> JSONResponse:
             meter_ids=payload.meter_ids,
             full_scale=full_scale,
             max_gap_days=max_gap_days,
+            align_days=payload.align_days,
+            reading_precision=payload.reading_precision,
         )
     except pipeline.PipelineError as exc:
         raise pipeline_error(exc) from exc
 
+    focus = result["focus"]
+    alignment = result["alignment"]
+    if alignment["publish_blocked"] and payload.allow_publish:
+        # 核对未通过：不写入任何新台账，活动台账保持上一版
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "published": False,
+                "month": payload.month,
+                "error": alignment["blocked_reason"],
+                "conflicts": alignment["conflicts"],
+                "alignment": alignment["summary"],
+                "active_version": _active_version_view(),
+                "totals": focus["totals"],
+            },
+        )
+    if alignment["publish_blocked"]:
+        # 显式只核对不发布：返回分析数值，但不产生台账版本
+        return JSONResponse(
+            status_code=201,
+            content={
+                "ok": True,
+                "published": False,
+                "month": payload.month,
+                "meters": result["selected"],
+                "totals": focus["totals"],
+                "alignment": {
+                    "summary": alignment["summary"],
+                    "points": alignment["points"],
+                    "conflicts": alignment["conflicts"],
+                    "publish_blocked": True,
+                    "blocked_reason": alignment["blocked_reason"],
+                },
+                "rows": [
+                    {
+                        "meter_id": row["meter_id"],
+                        "meter_name": row["meter_name"],
+                        "total": row["total"],
+                        "peak": row["peak"],
+                        "valley": row["valley"],
+                        "gap_days": row["gap_days"],
+                        "anomaly_count": row["anomaly_count"],
+                        "status": row["status"],
+                        "status_label": row["status_label"],
+                    }
+                    for row in focus["rows"]
+                ],
+                "review": focus["review"],
+                "active_version": _active_version_view(),
+            },
+        )
+
     run_id = f"run-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
     created_at = now_iso()
-    focus = result["focus"]
+    batch_key_value = publish.batch_key(
+        month=payload.month,
+        selected=result["selected"],
+        full_scale=full_scale,
+        max_gap_days=max_gap_days,
+        tou_tolerance=result["tou_tolerance"],
+        rows=rows,
+        changes=changes,
+        align_days=alignment["summary"]["align_days"],
+        reading_precision=alignment["summary"]["precision"],
+    )
     run_payload = {
         "run_id": run_id,
         "created_at": created_at,
@@ -390,31 +544,94 @@ def api_restore(payload: RestoreRequest = Body(...)) -> JSONResponse:
         "month_order": result["month_order"],
         "stats": result["stats"],
         "monitored": result["monitored"],
+        "alignment": alignment,
+        "batch_key": batch_key_value,
+    }
+    ledger_payload = {
+        "month_order": result["month_order"],
+        "months": {
+            month: result["months"][month]["rows"] for month in result["month_order"]
+        },
+        "stats": result["stats"],
+        "review": result["review"],
+        "selected": result["selected"],
+        "monitored": result["monitored"],
+        "alignment": alignment,
+        "run_id": run_id,
+        "month": payload.month,
+        "batches": _ledger_sources(rows, result["selected"]),
     }
     with store.session() as conn:
         store.init_schema(conn)
-        store.save_run(conn, run_payload)
-        store.add_event(
-            conn,
-            "restore",
-            f"还原 {payload.month}：{len(focus['rows'])} 块表，总用量 {focus['totals']['usage_total']:g} kWh",
-            {
-                "run_id": run_id,
-                "month": payload.month,
-                "meters": result["selected"],
-                "totals": focus["totals"],
-            },
-            created_at,
-        )
+        active_before = store.active_ledger(conn)
+        previous_version_id = active_before["version_id"] if active_before else None
+    try:
+        with store.session() as conn:
+            store.init_schema(conn)
+            previous_run = store.find_run_by_batch(conn, batch_key_value)
+            if previous_run:
+                run_payload["run_id"] = previous_run["run_id"]
+                run_id = previous_run["run_id"]
+                ledger_payload["run_id"] = run_id
+            store.save_run(conn, run_payload)
+            info = publish.publish(
+                conn,
+                batch_key_value=batch_key_value,
+                run_id=run_id,
+                month=payload.month,
+                month_order=result["month_order"],
+                payload=ledger_payload,
+            )
+            run_payload["ledger_version"] = info["version_id"]
+            run_payload["previous_version"] = info["previous_version_id"]
+            run_payload["ledger_reused"] = info["reused"]
+            store.save_run(conn, run_payload)
+            store.add_event(
+                conn,
+                "restore",
+                (
+                    f"还原 {payload.month}：{len(focus['rows'])} 块表，总用量 {focus['totals']['usage_total']:g} kWh；"
+                    f"台账版本 {info['version_id']}"
+                    + ("（同批重试，复用已有版本，不重复计量）" if info["reused"] else " 已发布")
+                ),
+                {
+                    "run_id": run_id,
+                    "batch_key": batch_key_value,
+                    "month": payload.month,
+                    "meters": result["selected"],
+                    "totals": focus["totals"],
+                    "ledger_version": info["version_id"],
+                    "reused_version": info["reused"],
+                },
+                created_at,
+            )
+    except Exception as exc:
+        # 版本写入/指针切换/批次/事件在同一事务里，失败已整体回滚；这里只补记恢复事件
+        with store.session() as conn:
+            store.init_schema(conn)
+            publish.record_failure(conn, previous_version_id, exc)
+        raise
 
     return JSONResponse(
         status_code=201,
         content={
             "ok": True,
+            "published": True,
             "run_id": run_id,
+            "batch_key": batch_key_value,
+            "ledger_version": info["version_id"],
+            "ledger_reused": info["reused"],
+            "previous_version": info["previous_version_id"],
+            "active_version": _active_version_view(),
             "month": payload.month,
             "meters": result["selected"],
             "totals": focus["totals"],
+            "alignment": {
+                "summary": alignment["summary"],
+                "points": alignment["points"],
+                "conflicts": alignment["conflicts"],
+                "publish_blocked": alignment["publish_blocked"],
+            },
             "rows": [
                 {
                     "meter_id": row["meter_id"],
@@ -501,6 +718,69 @@ def api_run_ledger(run_id: str) -> Response:
     )
 
 
+# --------------------------------------------------------------------------- 台账版本（发布 / 回滚）
+
+
+@app.get("/api/ledger/versions")
+def api_ledger_versions() -> dict:
+    with store.session() as conn:
+        store.init_schema(conn)
+        active = store.active_ledger(conn)
+        history = store.ledger_history(conn, limit=30)
+    return {
+        "ok": True,
+        "active_version": active["version_id"] if active else None,
+        "versions": [
+            {**item, "active": bool(active and item["version_id"] == active["version_id"])}
+            for item in history
+        ],
+    }
+
+
+@app.get("/api/ledger/active")
+def api_ledger_active() -> dict:
+    with store.session() as conn:
+        store.init_schema(conn)
+        active = store.active_ledger(conn)
+    if not active:
+        return {"ok": True, "active": None}
+    return {
+        "ok": True,
+        "active": {
+            "version_id": active["version_id"],
+            "batch_key": active["batch_key"],
+            "created_at": active["created_at"],
+            "month": active["month"],
+            "run_id": active["run_id"],
+            "month_order": active["month_order"],
+            "stats": (active["payload"] or {}).get("stats", {}),
+            "alignment": (active["payload"] or {}).get("alignment", {}).get("summary", {}),
+        },
+    }
+
+
+@app.post("/api/ledger/rollback")
+def api_ledger_rollback(payload: dict = Body(default=None)) -> JSONResponse:
+    version_id = (payload or {}).get("version_id")
+    with store.session() as conn:
+        store.init_schema(conn)
+        try:
+            target = publish.rollback(conn, version_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc).strip("'\"")) from exc
+    return JSONResponse(
+        status_code=200,
+        content={
+            "ok": True,
+            "rolled_back_to": target["version_id"],
+            "run_id": target["run_id"],
+            "month": target["month"],
+            "month_order": target["month_order"],
+            "active_version": _active_version_view(),
+        },
+    )
+
+
 @app.get("/api/runs/{run_id}/review.csv")
 def api_run_review(run_id: str) -> Response:
     with store.session() as conn:
@@ -511,10 +791,34 @@ def api_run_review(run_id: str) -> Response:
     return _csv_response(summary.review_csv(run["review"]), f"metercalc-review-{run['month']}.csv")
 
 
+def ledger_for_export() -> tuple[dict, str]:
+    """导出/复核用台账：优先取已发布的活动版本；没有发布版本时才用实时还原结果。"""
+    with store.session() as conn:
+        store.init_schema(conn)
+        active = store.active_ledger(conn)
+    if active:
+        payload = active["payload"] or {}
+        month_order = payload.get("month_order") or sorted((payload.get("months") or {}).keys())
+        month_rows = payload.get("months") or {}
+        return (
+            {
+                "months": {month: {"rows": month_rows.get(month, [])} for month in month_order},
+                "month_order": month_order,
+                "review": payload.get("review") or [],
+                "stats": payload.get("stats") or {},
+                "monitored": payload.get("monitored") or [],
+                "selected": payload.get("selected") or [],
+            },
+            f"active:{active['version_id']}",
+        )
+    ledger = analyze_all()
+    return ledger, "live"
+
+
 @app.get("/api/ledger.csv")
 def api_ledger() -> Response:
     try:
-        ledger = analyze_all()
+        ledger, _src = ledger_for_export()
     except pipeline.PipelineError as exc:
         raise pipeline_error(exc) from exc
     return _csv_response(summary.ledger_csv(ledger["months"]), "metercalc-ledger-all.csv")
@@ -523,7 +827,7 @@ def api_ledger() -> Response:
 @app.get("/api/review.csv")
 def api_review() -> Response:
     try:
-        ledger = analyze_all()
+        ledger, _src = ledger_for_export()
     except pipeline.PipelineError as exc:
         raise pipeline_error(exc) from exc
     return _csv_response(summary.review_csv(ledger["review"]), "metercalc-review-all.csv")

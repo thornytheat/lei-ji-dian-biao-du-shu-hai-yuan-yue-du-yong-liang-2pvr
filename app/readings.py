@@ -12,6 +12,11 @@ from datetime import date
 KINDS = ("total", "peak", "valley")
 KIND_LABELS = {"total": "总电量", "peak": "峰段", "valley": "谷段"}
 REQUIRED_COLUMNS = ("meter_id", "read_at", "reading_kwh", "kind")
+OPTIONAL_COLUMNS = ("source",)
+# 读数来源：现场抄表 / 自动采集。缺省按现场抄表处理，兼容旧 CSV。
+SOURCES = ("manual", "auto")
+SOURCE_LABELS = {"manual": "现场抄表", "auto": "自动采集"}
+DEFAULT_SOURCE = "manual"
 MAX_PROBLEMS = 40
 
 
@@ -47,11 +52,25 @@ def parse_reading(text: str) -> float:
         raise ValueError("读数不能是 NaN")
     if value < 0:
         raise ValueError(f"读数不能为负：{value}")
-    return round(value, 1)
+    # 现场抄表通常 1 位小数，自动采集可能到 2 位；保留到 3 位，精度由 decimal_places 单独记录
+    return round(value, 3)
+
+
+def decimal_places(text: str) -> int:
+    """原始文本的末位小数位数（用于来源对齐时判断精度）。最多按 3 位计。"""
+    raw = (text or "").strip().lower()
+    if "." not in raw:
+        return 0
+    tail = raw.split(".", 1)[1]
+    digits = "".join(ch for ch in tail if ch.isdigit())
+    return min(len(digits), 3)
 
 
 def parse_csv(text: str) -> dict:
-    """解析读数 CSV。返回 {rows, stats}；有问题时抛 ReadingError（携全部问题）。"""
+    """解析读数 CSV。返回 {rows, stats}；有问题时抛 ReadingError（携全部问题）。
+
+    `source` 是可选列（manual / auto），缺省按 manual；不带该列的旧文件仍可导入。
+    """
     if not (text or "").strip():
         raise ReadingError("读数文件为空", [{"line": 0, "field": "file", "message": "文件内容为空"}])
     sample = text[1:] if text.startswith("\ufeff") else text
@@ -67,19 +86,29 @@ def parse_csv(text: str) -> dict:
 
     rows: list[dict] = []
     problems: list[dict] = []
-    seen: dict[tuple[str, str, str], int] = {}
+    seen: dict[tuple[str, str, str, str], int] = {}
 
     for index, raw in enumerate(reader, start=2):
         if raw is None or all((v or "").strip() == "" for v in raw.values() if isinstance(v, str)):
             continue  # 空行跳过
         meter_id = (raw.get("meter_id") or "").strip()
         kind = (raw.get("kind") or "").strip().lower()
+        source = (raw.get("source") or "").strip().lower() or DEFAULT_SOURCE
         if not meter_id:
             problems.append({"line": index, "field": "meter_id", "message": "表号为空"})
             continue
         if kind not in KINDS:
             problems.append(
                 {"line": index, "field": "kind", "message": f"未知电量类型 {kind!r}，只支持 total/peak/valley"}
+            )
+            continue
+        if source not in SOURCES:
+            problems.append(
+                {
+                    "line": index,
+                    "field": "source",
+                    "message": f"未知读数来源 {source!r}，只支持 manual/auto（现场抄表/自动采集）",
+                }
             )
             continue
         try:
@@ -92,19 +121,30 @@ def parse_csv(text: str) -> dict:
         except ValueError as exc:
             problems.append({"line": index, "field": "reading_kwh", "message": str(exc)})
             continue
-        key = (meter_id, read_at.isoformat(), kind)
+        key = (meter_id, read_at.isoformat(), kind, source)
         if key in seen:
             problems.append(
                 {
                     "line": index,
                     "field": "read_at",
-                    "message": f"重复读数：{meter_id} {read_at} {kind} 已在第 {seen[key]} 行出现",
+                    "message": (
+                        f"重复读数：{meter_id} {read_at} {kind}（{SOURCE_LABELS[source]}）"
+                        f" 已在第 {seen[key]} 行出现"
+                    ),
                 }
             )
             continue
         seen[key] = index
         rows.append(
-            {"meter_id": meter_id, "read_at": read_at, "reading_kwh": value, "kind": kind, "line": index}
+            {
+                "meter_id": meter_id,
+                "read_at": read_at,
+                "reading_kwh": value,
+                "kind": kind,
+                "source": source,
+                "precision": decimal_places(raw.get("reading_kwh") or ""),
+                "line": index,
+            }
         )
 
     if not rows and not problems:
@@ -123,6 +163,10 @@ def parse_csv(text: str) -> dict:
             "date_from": dates[0].isoformat(),
             "date_to": dates[-1].isoformat(),
             "kinds": sorted({row["kind"] for row in rows}),
+            "sources": sorted({row["source"] for row in rows}),
+            "source_counts": {
+                source: sum(1 for row in rows if row["source"] == source) for source in SOURCES
+            },
         },
     }
 

@@ -44,6 +44,11 @@
       区间 {{ focus.month_start }} ~ {{ focus.month_end }} ·
       量程 {{ run.full_scale | num1 }} kWh · 缺口阈值 {{ run.max_gap_days }} 天 ·
       峰谷容差 {{ (run.tou_tolerance * 100) | round(1) }}%
+      {% if run.alignment %}
+      <br>读数来源：现场抄表 {{ run.alignment.summary.manual_points }} 点 · 自动采集 {{ run.alignment.summary.auto_points }} 点 ·
+      同一读数点合并 {{ run.alignment.summary.merged_points }} 处 ·
+      台账版本 <code>{{ run.ledger_version or '—' }}</code>
+      {% endif %}
     </p>
   </div>
   <div class="page-head-actions">
@@ -82,6 +87,7 @@
       <button type="button" data-tab-target="tab-basis">分摊依据</button>
       <button type="button" data-tab-target="tab-gap">缺口与异常</button>
       <button type="button" data-tab-target="tab-tou">分时校验</button>
+      <button type="button" data-tab-target="tab-source">来源对齐</button>
     </div>
     <div class="panel-actions">
       <span class="tag">{{ totals.meters }} 表 · {{ totals.review_items }} 复核项</span>
@@ -237,8 +243,14 @@
                 <td class="mono nowrap">{{ group.row.meter_id }}</td>
                 <td class="small nowrap">{{ item.start }} → {{ item.end }}</td>
                 <td class="num">{{ item.days }}</td>
-                <td class="num">{{ item.prev_value | num1 }}</td>
-                <td class="num">{{ item.next_value | num1 }}</td>
+                <td class="num">
+                  {{ item.prev_value | num1 }}
+                  {% if item.prev_point %}<div class="small muted">{{ item.prev_point.source_label }}{% if item.prev_point.date_span_days %} · 日期对齐 {{ item.prev_point.date_span_days }} 天{% endif %}</div>{% endif %}
+                </td>
+                <td class="num">
+                  {{ item.next_value | num1 }}
+                  {% if item.next_point %}<div class="small muted">{{ item.next_point.source_label }}{% if item.next_point.date_span_days %} · 日期对齐 {{ item.next_point.date_span_days }} 天{% endif %}</div>{% endif %}
+                </td>
                 <td class="num">{{ item.usage | num1 if item.usage is not none else '隔离' }}</td>
                 <td class="num">
                   {{ item.month_share | num1 if item.month_share is not none else '—' }}
@@ -249,6 +261,12 @@
                 <td class="small">
                   <span class="tag {{ 'err' if item.status == 'anomaly' else ('warn' if item.gap else ('ok' if item.status == 'normal' else '')) }}">{{ item.status_label }}</span>
                   {{ item.formula if item.formula else item.reason }}
+                  {% if item.prev_point and item.prev_point.merged %}
+                  <div class="muted">前点对齐：{{ item.prev_point.rationale }}</div>
+                  {% endif %}
+                  {% if item.next_point and item.next_point.merged %}
+                  <div class="muted">后点对齐：{{ item.next_point.rationale }}</div>
+                  {% endif %}
                   {% if item.status in ['meter_change', 'rollover'] and item.segments %}
                   <ul class="list small">
                     {% for seg in item.segments %}
@@ -399,6 +417,70 @@
         <p class="small muted" style="margin:0">本月无需复核的事项。</p>
         {% endif %}
       </div>
+    </div>
+
+    <div id="tab-source" class="tab-panel" hidden>
+      {% set align = run.alignment %}
+      <div class="panel-body tight">
+        <h3 style="margin-top:0">现场抄表与自动采集对齐（同一表计 × 电量类型）</h3>
+        <p class="small muted" style="margin:0">
+          两路来源先对齐成同一个读数点再做差：日期相差 ≤ {{ align.summary.align_days if align else 1 }} 天且读数在精度
+          {{ align.summary.precision if align else 0.1 }} kWh 以内 → 合并为一点（日期以现场抄表为准，数值取精度更细的一路）；
+          同一天但读数超精度或同一来源前后矛盾 → 记 P1 并<strong>不发布新台账</strong>。
+        </p>
+        {% if align %}
+        <div class="kpi-strip" style="margin-top:10px">
+          <div class="kpi">
+            <div class="k-label">原始读数行</div>
+            <div class="k-value">{{ align.summary.raw_rows }}</div>
+            <div class="k-note">现场抄表 + 自动采集</div>
+          </div>
+          <div class="kpi">
+            <div class="k-label">对齐后读数点</div>
+            <div class="k-value">{{ align.summary.aligned_points }}</div>
+            <div class="k-note">合并 {{ align.summary.merged_points }} 处</div>
+          </div>
+          <div class="kpi {{ 'err' if align.summary.conflicts else 'ok' }}">
+            <div class="k-label">来源矛盾</div>
+            <div class="k-value">{{ align.summary.conflicts }}</div>
+            <div class="k-note">超精度 {{ align.summary.cross_source_deviation }} · 同源矛盾 {{ align.summary.same_source_conflict }}</div>
+          </div>
+        </div>
+        {% endif %}
+      </div>
+      <div class="table-wrap roomy">
+        <table class="dense">
+          <thead>
+            <tr><th>表号</th><th>类型</th><th>对齐读数日</th><th class="num">采用读数</th><th>来源</th><th class="num">日期差</th><th class="num">两路偏差</th><th>取舍依据</th></tr>
+          </thead>
+          <tbody>
+            {% for point in (align.points if align else []) %}
+            <tr class="{{ 'row-anomaly' if point.conflict else '' }}">
+              <td class="mono nowrap">{{ point.meter_id }}</td>
+              <td class="small nowrap">{{ point.kind_label }}</td>
+              <td class="small nowrap">{{ point.read_at }}</td>
+              <td class="num">{{ point.value | num1 }}</td>
+              <td class="small nowrap">{{ point.source_label }}</td>
+              <td class="num">{{ point.date_span_days }} 天</td>
+              <td class="num">{{ point.diff | num if point.diff is not none else '—' }}</td>
+              <td class="small">{{ point.rationale }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="8" class="muted">本批次没有需要合并的重复来源读数点。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if align and align.conflicts %}
+      <div class="panel-body tight">
+        <h3>来源矛盾（P1，未发布台账）</h3>
+        <ul class="list small" style="margin-bottom:0">
+          {% for conflict in align.conflicts %}
+          <li>{{ conflict.message }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+      {% endif %}
     </div>
 
     <div id="tab-tou" class="tab-panel" hidden>

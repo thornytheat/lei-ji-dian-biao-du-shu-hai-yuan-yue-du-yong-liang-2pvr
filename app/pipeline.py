@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from . import proration, readings, restore, settings, summary, validation
+from . import alignment, proration, readings, restore, settings, summary
 
 KINDS = readings.KINDS
 
@@ -30,11 +30,15 @@ def analyze(
     full_scale: float = settings.DEFAULT_FULL_SCALE,
     max_gap_days: int = settings.MAX_GAP_DAYS,
     tou_tolerance: float = settings.TOU_TOLERANCE,
+    align_days: int | None = None,
+    reading_precision: float | None = None,
 ) -> dict:
     if not rows:
         raise PipelineError("读数库为空，请先导入读数 CSV 或样例数据")
 
-    series_all = readings.group_series(rows)
+    # 先把同一表计 × 电量类型的现场抄表 / 自动采集对齐成同一个读数点，再做差
+    aligned = alignment.align(rows, align_days=align_days, precision=reading_precision)
+    series_all = aligned["series"]
     available = sorted({meter for (meter, _kind) in series_all})
     requested = [m for m in (meter_ids or []) if m]
     unknown = [m for m in requested if m not in available]
@@ -86,6 +90,8 @@ def analyze(
         tou_tolerance=tou_tolerance,
         full_scale=full_scale,
         max_gap_days=max_gap_days,
+        points=aligned["points"],
+        alignment_conflicts=aligned["conflicts"],
     )
 
     payload = {
@@ -99,6 +105,21 @@ def analyze(
         "max_gap_days": max_gap_days,
         "tou_tolerance": tou_tolerance,
         "monitored": ledger["monitored"],
+        "alignment": {
+            "summary": aligned["summary"],
+            "conflicts": aligned["conflicts"],
+            "points": [
+                point
+                for point in aligned["points"]
+                if point["meter_id"] in selected and point["merged"]
+            ],
+            "publish_blocked": bool(aligned["conflicts"]),
+            "blocked_reason": (
+                f"{len(aligned['conflicts'])} 处来源偏差超过抄表精度或同一来源前后矛盾，不发布新台账"
+                if aligned["conflicts"]
+                else ""
+            ),
+        },
     }
 
     if month:

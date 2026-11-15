@@ -59,8 +59,19 @@
             <input type="number" id="max_gap_days" name="max_gap_days" step="1" min="2" value="{{ max_gap_days }}">
           </div>
         </div>
+        <div class="form-inline">
+          <div class="field">
+            <label for="align_days">来源对齐日期容差（天）</label>
+            <input type="number" id="align_days" name="align_days" step="1" min="0" max="7" value="{{ align_days }}">
+          </div>
+          <div class="field">
+            <label for="reading_precision">读数精度容差（kWh）</label>
+            <input type="number" id="reading_precision" name="reading_precision" step="0.01" min="0.01" value="{{ reading_precision }}">
+          </div>
+        </div>
         <p class="small muted" style="margin:0">
-          当前库 <strong>{{ readings_rows }}</strong> 行读数 · {{ meters | length }} 块表 · 换表记录 {{ changes_count }} 条。
+          当前库 <strong>{{ readings_rows }}</strong> 行读数 · {{ meters | length }} 块表 · 换表记录 {{ changes_count }} 条 ·
+          来源构成 {{ source_counts.get('manual', 0) }} 行现场抄表 / {{ source_counts.get('auto', 0) }} 行自动采集。
         </p>
       </form>
 
@@ -73,6 +84,7 @@
           <p style="margin:0 0 6px">
             <button type="submit" class="secondary small">导入并校验</button>
             <button type="button" class="secondary small" id="reimport-sample">重新导入样例（幂等）</button>
+            <button type="button" class="secondary small" id="reimport-dual-sample">导入双来源样例（现场+采集）</button>
           </p>
         </form>
         <div class="alert alert-error" id="import-error" hidden></div>
@@ -224,6 +236,14 @@
           </tbody>
         </table>
       </div>
+      {% if active_version %}
+      <div class="panel-actions">
+        <span class="small muted" style="align-self:center">
+          当前发布台账版本 <code>{{ active_version.version_id }}</code>（{{ active_version.month }}，执行于 {{ active_version.created_at }}）
+        </span>
+        <button type="button" class="btn secondary small" id="rollback-btn">回滚上一版</button>
+      </div>
+      {% endif %}
     </section>
   </div>
 </div>
@@ -288,7 +308,9 @@
         month: form.querySelector('#month').value,
         meter_ids: meterIds,
         full_scale: Number(form.querySelector('#full_scale').value) || 99999.9,
-        max_gap_days: Number(form.querySelector('#max_gap_days').value) || 31
+        max_gap_days: Number(form.querySelector('#max_gap_days').value) || 31,
+        align_days: Number(form.querySelector('#align_days').value),
+        reading_precision: Number(form.querySelector('#reading_precision').value) || 0.1
       };
       progress.hidden = false;
       setBusy(true);
@@ -306,10 +328,13 @@
         progress.hidden = true;
 
         var totals = data.totals || {};
+        var align = data.alignment || {};
+        var summary = align.summary || {};
         var metrics = document.getElementById('run-metrics');
         metrics.innerHTML = '';
         metrics.appendChild(kpi('本月总用量 kWh', num(totals.usage_total), (totals.meters || 0) + ' 块表 · ' + (totals.intervals || 0) + ' 个区间'));
         metrics.appendChild(kpi('参与还原的表', totals.meters || 0, '本次勾选 ' + (data.meters || []).join(' · ')));
+        metrics.appendChild(kpi('来源对齐', (summary.merged_points || 0) + ' 处合并', '现场 ' + (summary.manual_points || 0) + ' 点 · 采集 ' + (summary.auto_points || 0) + ' 点', (summary.conflicts ? 'err' : 'ok')));
         metrics.appendChild(kpi('缺口段', totals.gap_segments || 0, '缺失 ' + (totals.gap_days || 0) + ' 天，不插值', (totals.gap_segments ? 'warn' : 'ok')));
         metrics.appendChild(kpi('异常数', totals.anomaly_count || 0, '隔离 ' + (totals.anomalies || 0) + ' · 分时超差 ' + (totals.tou_flagged || 0), (totals.anomaly_count ? 'err' : 'ok')));
 
@@ -323,7 +348,8 @@
         document.getElementById('run-rows').innerHTML = rows.join('');
         linksBox.innerHTML = '<a class="btn small" href="' + data.result_url + '">打开结果页（含逐条依据）</a>' +
           '<a class="btn secondary small" href="' + data.export_url + '">导出台账 CSV</a>' +
-          '<span class="small muted" style="align-self:center">批次 <code>' + data.run_id + '</code></span>';
+          '<span class="small muted" style="align-self:center">批次 <code>' + data.run_id + '</code> · 台账版本 <code>' +
+          (data.ledger_version || '—') + '</code>' + (data.ledger_reused ? '（同批重试，复用版本）' : '') + '</span>';
         linksBox.hidden = false;
         if (emptyBox) emptyBox.hidden = true;
         resultBox.hidden = false;
@@ -380,6 +406,39 @@
         importNotice.textContent = '样例重新导入：' + data.reason + '（读数 ' + data.counts.readings + ' 行）';
       } catch (err) {
         window.showError(importError, err);
+      }
+    });
+  }
+
+  var dualBtn = document.getElementById('reimport-dual-sample');
+  if (dualBtn) {
+    dualBtn.addEventListener('click', async function () {
+      importError.hidden = true;
+      importNotice.hidden = true;
+      try {
+        var data = await window.postJSON('/api/import/sample?include_auto=true', {});
+        importNotice.hidden = false;
+        importNotice.textContent = '双来源样例导入：现场抄表 ' + (data.sources.manual || 0) + ' 行 + 自动采集 ' +
+          (data.sources.auto || 0) + ' 行，共 ' + data.counts.readings + ' 行；还原时会自动对齐同一读数点。';
+      } catch (err) {
+        window.showError(importError, err);
+      }
+    });
+  }
+
+  var rollbackBtn = document.getElementById('rollback-btn');
+  if (rollbackBtn) {
+    rollbackBtn.addEventListener('click', async function () {
+      rollbackBtn.disabled = true;
+      try {
+        var data = await window.postJSON('/api/ledger/rollback', {});
+        importNotice.hidden = false;
+        importNotice.textContent = '已回滚到台账版本 ' + data.rolled_back_to + '（' + data.month + '）。';
+        window.setTimeout(function () { window.location.reload(); }, 800);
+      } catch (err) {
+        window.showError(errorBox, err);
+      } finally {
+        rollbackBtn.disabled = false;
       }
     });
   }

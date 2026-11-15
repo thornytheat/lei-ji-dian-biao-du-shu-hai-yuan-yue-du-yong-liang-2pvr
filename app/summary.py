@@ -28,13 +28,20 @@ def _interval_overlaps_month(interval: dict, month_start: date, month_end: date)
     return validation.overlaps(interval["start"], interval["end"], month_start, month_end)
 
 
-def _evidence_row(interval: dict, meter_name: str, month: str) -> dict:
+def _evidence_row(interval: dict, meter_name: str, month: str, points_index: dict | None = None) -> dict:
     share = None
     part_days = None
     for part in (interval.get("proration") or {}).get("parts", []):
         if part["month"] == month:
             share = part["share"]
             part_days = part["days"]
+    index = points_index or {}
+    prev_point = index.get((interval["meter_id"], interval["kind"], interval["start"].isoformat()))
+    next_point = index.get((interval["meter_id"], interval["kind"], interval["end"].isoformat()))
+    sources = []
+    for point in (prev_point, next_point):
+        if point and point["source"] not in sources:
+            sources.append(point["source"])
     return {
         "meter_id": interval["meter_id"],
         "meter_name": meter_name,
@@ -62,6 +69,9 @@ def _evidence_row(interval: dict, meter_name: str, month: str) -> dict:
         "segments": interval.get("segments") or [],
         "change": interval.get("change"),
         "rollover": interval.get("rollover"),
+        "prev_point": prev_point,
+        "next_point": next_point,
+        "sources": sources,
     }
 
 
@@ -93,6 +103,8 @@ def build_ledger(
     tou_tolerance: float,
     full_scale: float,
     max_gap_days: int,
+    points: list[dict] | None = None,
+    alignment_conflicts: list[dict] | None = None,
 ) -> dict:
     ledger_months: dict[str, dict] = {}
     review: list[dict] = []
@@ -100,6 +112,9 @@ def build_ledger(
     usage_total = 0.0
     interval_total = 0
     anomaly_total = 0
+    points_index = {
+        (point["meter_id"], point["kind"], point["read_at"]): point for point in (points or [])
+    }
 
     for meter_id in selected:
         entry = restored.get(meter_id, {})
@@ -260,11 +275,29 @@ def build_ledger(
                 for interval in restored.get(meter_id, {}).get("kinds", {}).get(kind, {}).get("intervals", []):
                     if not _interval_overlaps_month(interval, month_start, month_end):
                         continue
-                    month_block["evidence"].append(_evidence_row(interval, meter_name, month))
+                    month_block["evidence"].append(
+                        _evidence_row(interval, meter_name, month, points_index)
+                    )
 
         month_block["review"] = _review_items(month_block, month)
+        month_block["alignment_conflicts"] = []
         review.extend(month_block["review"])
         ledger_months[month] = month_block
+
+    # 来源对齐冲突：按读数点所在月份挂到对应台账月份（找不到对应月份则挂到首月）
+    conflict_items = _alignment_review_items(alignment_conflicts or [])
+    for item in conflict_items:
+        target = item.pop("_month_target", "")
+        block = ledger_months.get(target)
+        if block is None and ledger_months:
+            block = ledger_months[months[0]]
+        if block is None:
+            continue
+        item["month"] = target if target in ledger_months else (months[0] if months else "")
+        block["alignment_conflicts"].append(item)
+        block["review"].append(item)
+        review.append(item)
+    review.sort(key=lambda item: (item["month"], item["level"], item["meter_id"], item["kind"]))
 
     stats = {
         "months": len(months),
@@ -279,8 +312,41 @@ def build_ledger(
         "gaps": sum(len(block["gaps"]) for block in ledger_months.values()),
         "meter_changes": sum(len(block["changes"]) for block in ledger_months.values()),
         "rollovers": sum(len(block["rollovers"]) for block in ledger_months.values()),
+        "alignment_conflicts": len(conflict_items),
     }
     return {"months": ledger_months, "review": review, "stats": stats, "monitored": monitored}
+
+
+def _alignment_review_items(conflicts: list[dict]) -> list[dict]:
+    """来源偏差超精度 / 同源矛盾 → P1 复核项（并阻止台账发布）。"""
+    items: list[dict] = []
+    for conflict in conflicts:
+        date_text = str(conflict.get("date") or "")
+        detail = conflict.get("detail") or {}
+        label = "来源偏差超精度" if conflict.get("type") == "cross_source_deviation" else "同一来源前后矛盾"
+        action = (
+            "到现场核对表码，确认自动采集是否抄错/换表未登记；在偏差消除前不发布新台账"
+            if conflict.get("type") == "cross_source_deviation"
+            else "核对该来源导出批次是否重复或表计时钟错误，保留原始导出文件后重新采集"
+        )
+        basis = conflict.get("message") or ""
+        if detail.get("diff") is not None:
+            basis += f"（偏差 {detail['diff']:g} kWh，精度容差 ±{detail['tolerance']:g}）"
+        items.append(
+            {
+                "month": "",
+                "_month_target": date_text[:7],
+                "meter_id": conflict.get("meter_id", ""),
+                "meter_name": conflict.get("meter_id", ""),
+                "level": "P1",
+                "level_label": LEVEL_LABELS["P1"],
+                "kind": label,
+                "summary": conflict.get("message") or label,
+                "action": action,
+                "basis": basis,
+            }
+        )
+    return items
 
 
 def _review_items(block: dict, month: str) -> list[dict]:
@@ -369,6 +435,8 @@ def _review_items(block: dict, month: str) -> list[dict]:
     return items
 
 
+
+
 def build_focus(
     *,
     month: str,
@@ -398,6 +466,7 @@ def build_focus(
             "rollovers": [],
             "checks": [],
             "review": [],
+            "alignment_conflicts": [],
             "totals": {},
         }
 
@@ -434,6 +503,7 @@ def build_focus(
         "rollovers": block["rollovers"],
         "checks": block["checks"],
         "review": month_review,
+        "alignment_conflicts": block.get("alignment_conflicts", []),
         "totals": {
             "usage_total": usage_total,
             "peak_total": peak_total,

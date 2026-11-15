@@ -27,8 +27,10 @@ CREATE TABLE IF NOT EXISTS readings (
     read_at     TEXT NOT NULL,
     reading_kwh REAL NOT NULL,
     kind        TEXT NOT NULL,
+    source      TEXT NOT NULL DEFAULT 'manual',
+    precision   INTEGER NOT NULL DEFAULT 1,
     imported_at TEXT NOT NULL,
-    UNIQUE (meter_id, read_at, kind)
+    UNIQUE (meter_id, read_at, kind, source)
 );
 CREATE TABLE IF NOT EXISTS changes (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,6 +46,16 @@ CREATE TABLE IF NOT EXISTS runs (
     meters     TEXT NOT NULL,
     payload    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ledger_versions (
+    version_id   TEXT PRIMARY KEY,
+    batch_key    TEXT NOT NULL UNIQUE,
+    ledger_key   TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    run_id       TEXT NOT NULL,
+    month        TEXT NOT NULL,
+    month_order  TEXT NOT NULL,
+    payload      TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     at      TEXT NOT NULL,
@@ -56,6 +68,8 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 """
+
+ACTIVE_LEDGER_KEY = "active_ledger_version"
 
 
 def connect(db_path: Path | None = None) -> sqlite3.Connection:
@@ -73,12 +87,53 @@ def session(db_path: Path | None = None):
     try:
         yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
 
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    except sqlite3.DatabaseError:
+        return set()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """老库升级：读数表补 source/precision 并放宽唯一键；runs 补 batch_key。"""
+    columns = _columns(conn, "readings")
+    if columns and "source" not in columns:
+        conn.executescript(
+            """
+            ALTER TABLE readings RENAME TO readings_legacy;
+            CREATE TABLE readings (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                meter_id    TEXT NOT NULL,
+                read_at     TEXT NOT NULL,
+                reading_kwh REAL NOT NULL,
+                kind        TEXT NOT NULL,
+                source      TEXT NOT NULL DEFAULT 'manual',
+                precision   INTEGER NOT NULL DEFAULT 1,
+                imported_at TEXT NOT NULL,
+                UNIQUE (meter_id, read_at, kind, source)
+            );
+            INSERT INTO readings (meter_id, read_at, reading_kwh, kind, source, precision, imported_at)
+            SELECT meter_id, read_at, reading_kwh, kind, 'manual', 1, imported_at FROM readings_legacy;
+            DROP TABLE readings_legacy;
+            """
+        )
+    run_columns = _columns(conn, "runs")
+    if run_columns and "batch_key" not in run_columns:
+        conn.execute("ALTER TABLE runs ADD COLUMN batch_key TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_batch_key ON runs(batch_key)")
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    conn.commit()
+    _migrate(conn)
     conn.commit()
 
 
@@ -127,9 +182,20 @@ def all_meters(conn: sqlite3.Connection) -> list[dict]:
 def replace_readings(conn: sqlite3.Connection, rows: list[dict], now: str) -> int:
     conn.execute("DELETE FROM readings")
     conn.executemany(
-        "INSERT INTO readings (meter_id, read_at, reading_kwh, kind, imported_at) VALUES (?, ?, ?, ?, ?)",
+        """
+        INSERT INTO readings (meter_id, read_at, reading_kwh, kind, source, precision, imported_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
         [
-            (row["meter_id"], row["read_at"].isoformat(), float(row["reading_kwh"]), row["kind"], now)
+            (
+                row["meter_id"],
+                row["read_at"].isoformat(),
+                float(row["reading_kwh"]),
+                row["kind"],
+                row.get("source") or "manual",
+                int(row.get("precision", 1)),
+                now,
+            )
             for row in rows
         ],
     )
@@ -138,7 +204,8 @@ def replace_readings(conn: sqlite3.Connection, rows: list[dict], now: str) -> in
 
 def all_readings(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
-        "SELECT meter_id, read_at, reading_kwh, kind FROM readings ORDER BY meter_id, read_at, kind"
+        "SELECT meter_id, read_at, reading_kwh, kind, source, precision FROM readings "
+        "ORDER BY meter_id, read_at, kind, source"
     ).fetchall()
     return [
         {
@@ -146,6 +213,8 @@ def all_readings(conn: sqlite3.Connection) -> list[dict]:
             "read_at": date.fromisoformat(row["read_at"]),
             "reading_kwh": float(row["reading_kwh"]),
             "kind": row["kind"],
+            "source": row["source"],
+            "precision": int(row["precision"]),
         }
         for row in rows
     ]
@@ -188,16 +257,36 @@ def count_changes(conn: sqlite3.Connection) -> int:
 
 
 def save_run(conn: sqlite3.Connection, payload: dict) -> None:
+    batch_key = payload.get("batch_key") or ""
+    if batch_key:
+        existing = conn.execute(
+            "SELECT run_id FROM runs WHERE batch_key = ?", (batch_key,)
+        ).fetchone()
+        if existing:
+            # 同批重试：复用原批次号，不产生第二个批次（避免用量重复计入）
+            payload = dict(payload)
+            payload["run_id"] = existing["run_id"]
     conn.execute(
-        "INSERT OR REPLACE INTO runs (run_id, created_at, month, meters, payload) VALUES (?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO runs (run_id, created_at, month, meters, batch_key, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
         (
             payload["run_id"],
             payload["created_at"],
             payload.get("month") or "",
             ",".join(payload.get("selected") or []),
+            batch_key,
             json.dumps(payload, ensure_ascii=False),
         ),
     )
+
+
+def find_run_by_batch(conn: sqlite3.Connection, batch_key: str) -> dict | None:
+    if not batch_key:
+        return None
+    row = conn.execute(
+        "SELECT payload FROM runs WHERE batch_key = ? ORDER BY rowid DESC LIMIT 1", (batch_key,)
+    ).fetchone()
+    return json.loads(row["payload"]) if row else None
 
 
 def load_run(conn: sqlite3.Connection, run_id: str) -> dict | None:
@@ -220,7 +309,8 @@ def latest_run(conn: sqlite3.Connection, month: str | None = None) -> dict | Non
 
 def list_runs(conn: sqlite3.Connection, limit: int = 10) -> list[dict]:
     rows = conn.execute(
-        "SELECT run_id, created_at, month, meters FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        "SELECT run_id, created_at, month, meters, batch_key FROM runs "
+        "ORDER BY created_at DESC, rowid DESC LIMIT ?",
         (limit,),
     ).fetchall()
     return [
@@ -229,9 +319,94 @@ def list_runs(conn: sqlite3.Connection, limit: int = 10) -> list[dict]:
             "created_at": row["created_at"],
             "month": row["month"],
             "meters": row["meters"].split(",") if row["meters"] else [],
+            "batch_key": row["batch_key"] or "",
         }
         for row in rows
     ]
+
+
+# --------------------------------------------------------------------------- 台账版本（原子发布 / 回滚）
+
+
+def active_ledger(conn: sqlite3.Connection) -> dict | None:
+    version_id = get_meta(conn, ACTIVE_LEDGER_KEY)
+    if not version_id:
+        return None
+    row = conn.execute(
+        "SELECT * FROM ledger_versions WHERE version_id = ?", (version_id,)
+    ).fetchone()
+    return _ledger_row(row) if row else None
+
+
+def ledger_by_batch(conn: sqlite3.Connection, batch_key: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM ledger_versions WHERE batch_key = ?", (batch_key,)
+    ).fetchone()
+    return _ledger_row(row) if row else None
+
+
+def load_ledger_version(conn: sqlite3.Connection, version_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM ledger_versions WHERE version_id = ?", (version_id,)
+    ).fetchone()
+    return _ledger_row(row) if row else None
+
+
+def ledger_history(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM ledger_versions ORDER BY rowid DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [
+        {
+            "version_id": row["version_id"],
+            "batch_key": row["batch_key"],
+            "ledger_key": row["ledger_key"],
+            "created_at": row["created_at"],
+            "run_id": row["run_id"],
+            "month": row["month"],
+            "month_order": json.loads(row["month_order"] or "[]"),
+        }
+        for row in rows
+    ]
+
+
+def _ledger_row(row: sqlite3.Row) -> dict:
+    return {
+        "version_id": row["version_id"],
+        "batch_key": row["batch_key"],
+        "ledger_key": row["ledger_key"],
+        "created_at": row["created_at"],
+        "run_id": row["run_id"],
+        "month": row["month"],
+        "month_order": json.loads(row["month_order"] or "[]"),
+        "payload": json.loads(row["payload"] or "{}"),
+    }
+
+
+def save_ledger_version(conn: sqlite3.Connection, version: dict) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO ledger_versions "
+        "(version_id, batch_key, ledger_key, created_at, run_id, month, month_order, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            version["version_id"],
+            version["batch_key"],
+            version["ledger_key"],
+            version["created_at"],
+            version["run_id"],
+            version["month"],
+            json.dumps(version.get("month_order") or [], ensure_ascii=False),
+            json.dumps(version["payload"], ensure_ascii=False),
+        ),
+    )
+
+
+def activate_ledger(conn: sqlite3.Connection, version_id: str) -> None:
+    """一次性切换：只改 meta 指针，历史版本保留用于回滚。"""
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (ACTIVE_LEDGER_KEY, version_id),
+    )
 
 
 # --------------------------------------------------------------------------- 事件 / 元数据

@@ -4,14 +4,17 @@
 {% block meta %}{% set stats = ledger.stats if ledger else {} %}
 <span class="dot {{ 'warn' if stats.get('review_items', 0) else 'ok' }}"></span>
 {{ months | length }} 个月 · {{ stats.get('meters', 0) }} 块表 · 复核项 {{ stats.get('review_items', 0) }} 条（P1 {{ stats.get('review_p1', 0) }}）
+{% if ledger_source and ledger_source.startswith('active:') %} · 已发布 <code>{{ ledger_source[7:] }}</code>
+{% elif ledger_source == 'live' %} · 实时口径（尚未发布）
+{% endif %}
 {% endblock %}
 {% block actions %}
 <a class="btn small" href="/api/ledger.csv">导出全期台账 CSV</a>
 <a class="btn secondary small" href="/api/review.csv">导出复核清单 CSV</a>
 <a class="btn secondary small" href="/workbench">回工作台</a>
 {% endblock %}
-{% block status_left %}台账口径：区间用量按天数分摊到日历月，合计与区间用量守恒（误差 0）；异常区间隔离不计入{% endblock %}
-{% block status_right %}{{ app_name }} · 高亮月份 {{ focus_month or '—' }}{% endblock %}
+{% block status_left %}台账口径：区间用量按天数分摊到日历月，合计与区间用量守恒（误差 0）；异常区间隔离不计入；来源对齐后每表每类型一条序列{% endblock %}
+{% block status_right %}{{ app_name }} · 已发布版本 {{ active_version.version_id if active_version else '—' }}{% endblock %}
 
 {% block content %}
 {% set stats = ledger.stats if ledger else {} %}
@@ -172,6 +175,42 @@
         </span>
       </div>
     </section>
+
+    <details class="help" style="margin-top:12px">
+      <summary>台账版本与发布 / 回滚</summary>
+      <p class="small" style="margin:6px 0">
+        台账发布 = 核对通过后一次性切换版本。来源偏差超过抄表精度或同一来源前后矛盾时<strong>不发布新台账</strong>，
+        活动指针保持上一版；发布过程失败会显式恢复上一版，同一批数据重试复用同一版本、不叠加用量。
+      </p>
+      <div class="table-wrap auto">
+        <table class="dense">
+          <tbody>
+            <tr><th style="width:150px">活动版本</th><td class="mono">{{ active_version.version_id if active_version else '—' }}</td></tr>
+            <tr><th>对应月份</th><td>{{ active_version.month if active_version else '—' }}</td></tr>
+            <tr><th>发布时间</th><td class="small muted">{{ active_version.created_at if active_version else '—' }}</td></tr>
+            <tr><th>读数来源构成</th><td class="small">现场抄表 {{ source_counts.get('manual', 0) }} 行 · 自动采集 {{ source_counts.get('auto', 0) }} 行</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="table-wrap auto" style="margin-top:8px">
+        <table class="dense">
+          <thead><tr><th>版本</th><th>月份</th><th>批次</th><th>发布时间</th><th>状态</th></tr></thead>
+          <tbody>
+          {% for version in (versions if versions is defined else []) %}
+            <tr>
+              <td class="mono small">{{ version.version_id }}</td>
+              <td>{{ version.month }}</td>
+              <td class="mono small">{{ version.batch_key }}</td>
+              <td class="small muted">{{ version.created_at }}</td>
+              <td>{% if active_version and version.version_id == active_version.version_id %}<span class="tag ok">当前</span>{% else %}<span class="tag">历史</span>{% endif %}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="5" class="muted">还没有发布过台账版本。</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
 
     <details class="help" style="margin-top:12px">
       <summary>还原批次与操作流水</summary>

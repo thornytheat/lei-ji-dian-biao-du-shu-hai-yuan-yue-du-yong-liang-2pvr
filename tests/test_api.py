@@ -201,3 +201,30 @@ def test_review_exports(client):
     assert review_rows[0][0] == "月份"
     assert any("分时超差" in row[4] for row in review_rows[1:])
     assert any("读数回退" in row[4] for row in review_rows[1:])
+
+
+def test_restore_reports_ledger_version_and_alignment(client):
+    response = client.post("/api/restore", json={"month": "2026-03"})
+    assert response.status_code == 201
+    body = response.json()
+    assert body["published"] is True
+    assert body["ledger_version"].startswith("lv-")
+    assert body["previous_version"] is None or body["previous_version"].startswith("lv-")
+    assert body["alignment"]["summary"]["merged_points"] == 0  # 单来源样例没有可合并点
+    assert body["alignment"]["summary"]["sources"] == ["manual"]
+
+    versions = client.get("/api/ledger/versions").json()
+    assert versions["active_version"] == body["ledger_version"]
+    active = client.get("/api/ledger/active").json()["active"]
+    assert active["version_id"] == body["ledger_version"]
+    assert active["month"] == "2026-03"
+
+
+def test_restore_rejects_invalid_alignment_params(client):
+    assert client.post("/api/restore", json={"month": "2026-03", "align_days": -1}).status_code == 422
+    assert client.post("/api/restore", json={"month": "2026-03", "reading_precision": 0}).status_code == 422
+
+
+def test_ledger_rollback_unknown_version(client):
+    # 指定不存在的版本 → 404（合法版本的回滚在 test_publish 里用独立库验证）
+    assert client.post("/api/ledger/rollback", json={"version_id": "lv-does-not-exist"}).status_code == 404

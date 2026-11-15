@@ -6,15 +6,23 @@
 
 ## 能力
 
-- **读数导入**：CSV 严格校验（列契约、ISO 日期真实性、数值、电量类型、重复读数），任一行不合法即整体拒绝并给出行号/列名/原因。
+- **读数导入**：CSV 严格校验（列契约、ISO 日期真实性、数值、电量类型、来源、重复读数），任一行不合法即整体拒绝并给出行号/列名/原因。
+- **来源对齐**：现场抄表（`manual`）与自动采集（`auto`）对同一表计 × 电量类型先对齐成同一个读数点，再做差；日期容差与末位精度可配。解决两路同时上报同一读数、日期差 1 天、精度 0.1/0.01 不一致时把两条当成连续读数、用量重复跨段或漏算的问题。
 - **换表/回绕识别**：`后读数 < 前读数` 时按换表记录分段求和，或按量程还原回绕量；两者都不成立就隔离为异常。
-- **用量还原**：逐区间给出前/后读数、区间天数、用量与算式。
+- **用量还原**：逐区间给出前/后读数、来源与取舍依据、区间天数、用量与算式。
 - **月度分摊**：区间跨月按天数比例分摊，保留 2 位小数，用最大余数法保证分摊合计与区间用量**完全相等**。
 - **分时校验**：`peak + valley ≈ total`，容差 0.5%，超差记异常但仍输出数值。
+- **台账发布**：核对通过后一次性切换版本（SQLite 单事务 + 活动指针），失败自动恢复上一版；同一批数据重试复用同一版本，**不叠加用量**。任一历史版本可回滚。
 - **复核清单**：月度台账（每表每月 total/peak/valley/缺口天数/异常数）+ P1/P2/P3 复核项 + CSV 导出。
 
 ## 核心规则
 
+0. **来源对齐**：同表同类型有两路来源时，主来源默认现场抄表（结算依据）。
+   - 两路读数在精度容差内一致且日期相差 ≤ `align_days`（默认 1 天）→ 合并为一个读数点：日期取现场抄表日期，数值取末位精度更细的一路，依据里保留两路原始值与取舍理由。
+   - 同一天两路读数偏差 > 精度容差 → `cross_source_deviation`，仍按现场抄表数值展示分析结果，但**禁止发布新台账**。
+   - 同一来源同一天给出两个不同读数 → `same_source_conflict`（来源前后矛盾），同样禁止发布。
+   - 其中一路缺失的读数点保留为独立点（不因另一路缺抄而丢量），但不会与另一路的相邻点误合并。
+   - 对齐完成后每个读数点只有一条，下游做差不会重复跨段。
 1. **区间用量**：`usage = 后读数 − 前读数`。
    - 后 < 前 且区间被换表记录覆盖（`start < 换表日 ≤ end`）→ 两表分段：
      `旧表尾段 = 拆表读数 − 前读数`，`新表首段 = 后读数 − 装表读数`，合计为区间用量。
@@ -49,13 +57,17 @@ SQLite 使用命名卷 `metercalc-data:/app/data`，启动时按样例版本幂�
 3. 结果页 `/result/{run_id}` 看：总用量 2225.82 kWh；EM-01 分时超差（峰+谷比总量少 49.2）；EM-03 跨月区间按 26/35 天分摊；EM-04 读数回退被隔离；EM-03 缺口 35 天、建议抄表日 2026-03-09。
 4. 换表月份：工作台选 `2025-09`（EM-02 于 09-15 换表，区间用量 28.0 = 13.4 + 14.6）。回绕月份：选 `2025-12`（EM-03 用量 17.4）。
 5. `/review` 看 12 个月全量台账与复核清单，导出 `/api/ledger.csv`、`/api/review.csv`。
+6. 双来源演示：工作台点「导入双来源样例（现场+采集）」，再执行还原。EM-01/EM-03 的 303 个自动采集点会与现场抄表对齐合并；结果页「来源对齐」页签给出每个合并点的两路原始值、日期差与取舍理由，台账用量与只用现场抄表完全一致（总用量仍为 2225.82）。
 
 命令行复现：
 
 ```bash
 curl -s -X POST http://127.0.0.1:18217/api/import/sample
+curl -s -X POST "http://127.0.0.1:18217/api/import/sample?include_auto=true"   # 双来源样例
 curl -s -X POST http://127.0.0.1:18217/api/restore \
   -H 'Content-Type: application/json' -d '{"month":"2026-03"}' | python3 -m json.tool | head -40
+curl -s http://127.0.0.1:18217/api/ledger/active          # 当前发布的台账版本
+curl -s -X POST http://127.0.0.1:18217/api/ledger/rollback -H 'Content-Type: application/json' -d '{}'
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18217/api/restore \
   -H 'Content-Type: application/json' -d '{"month":"2026-03","meter_ids":["EM-99"]}'   # 400
 ```
@@ -69,12 +81,14 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18217/api/rest
 | GET | `/workbench` | 工作台：选表选月份、导入读数、执行还原（带进度） |
 | GET | `/result/{run_id}` | 结果页：月度用能表、分摊依据、缺口、隔离异常、复核清单 |
 | GET | `/review` | 月度台账（全期）+ 复核清单 + 导出 |
-| POST | `/api/import` | multipart 上传读数 CSV（UTF-8/GBK），严格校验，整体替换 |
-| POST | `/api/import/sample` | 重新导入样例（幂等） |
-| POST | `/api/restore` | `{month, meter_ids?, full_scale?, max_gap_days?}` → 201 + run_id + 台账 + 依据 |
+| POST | `/api/import` | multipart 上传读数 CSV（UTF-8/GBK，可选 `source` 列），严格校验，整体替换 |
+| POST | `/api/import/sample` | 重新导入样例（幂等）；`?include_auto=true` 载入双来源样例（现场抄表 4140 行 + 自动采集 303 行） |
+| POST | `/api/restore` | `{month, meter_ids?, full_scale?, max_gap_days?, align_days?, reading_precision?, allow_publish?}` → 201 + run_id + 台账 + 依据；来源矛盾时 409 且不发布 |
 | GET | `/api/runs`, `/api/runs/{run_id}` | 批次列表 / 批次详情 |
 | GET | `/api/runs/{run_id}/ledger.csv`、`/api/runs/{run_id}/review.csv` | 本月台账 / 复核清单 CSV |
-| GET | `/api/ledger.csv`、`/api/review.csv` | 全期台账 / 复核清单 CSV |
+| GET | `/api/ledger.csv`、`/api/review.csv` | 全期台账 / 复核清单 CSV（优先取已发布的活动版本） |
+| GET | `/api/ledger/active`、`/api/ledger/versions` | 当前发布版本 / 版本历史 |
+| POST | `/api/ledger/rollback` | `{version_id?}` → 切回指定或上一版，返回活动版本 |
 
 错误输入返回 4xx 且带中文原因：未知表号（400 + 可选表号列表）、月份格式错误（400）、
 该月无读数覆盖（400）、量程非正（400）、缺口阈值 < 2（400）、CSV 行级错误（400 + 逐行问题）。
@@ -84,22 +98,25 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18217/api/rest
 ```text
 app/
   main.py          # 路由（薄）：页面 + JSON API
-  settings.py      # 路径/常量（量程、缺口阈值、容差）
-  readings.py      # 读数解析/校验/分组/缺口检测
+  settings.py      # 路径/常量（量程、缺口阈值、容差、来源对齐阈值）
+  readings.py      # 读数解析/校验/分组/缺口检测（含可选 source 列）
+  alignment.py     # 现场抄表/自动采集同一读数点对齐、偏差超精度与同源矛盾识别
   restore.py       # 区间用量、换表分段、回绕、异常隔离
   proration.py     # 跨月按天分摊（最大余数法守恒）
   validation.py    # 峰谷容差、缺口月份重叠、覆盖说明
   summary.py       # 月度台账、复核清单、CSV 导出
-  pipeline.py      # 编排：一次还原 → 全月份汇总 + 指定月份聚焦
-  store.py         # SQLite（读数/换表/台账/批次/事件）
+  pipeline.py      # 编排：来源对齐 → 一次还原 → 全月份汇总 + 指定月份聚焦
+  publish.py       # 台账版本发布/回滚（批量指纹幂等、单事务切换、失败恢复）
+  store.py         # SQLite（读数/换表/台账/版本/批次/事件）
   seed.py          # 幂等 seed
   templates/       # base/index/workbench/result/review
   static/          # app.js, style.css（原生 JS/CSS，无框架无 CDN）
 sample_data/
-  readings.csv         # 4 块表 × 每日读数 × 12 个月（total/peak/valley）= 4140 行
+  readings.csv         # 4 块表 × 每日读数 × 12 个月（total/peak/valley）= 4140 行（现场抄表）
+  readings_auto.csv    # 自动采集样例：EM-01/EM-03 每周一点、2 位小数、部分日期晚 1 天 = 303 行
   meter_changes.json   # 换表记录（旧表号/新表号/换表日/拆表读数/装表读数，按类型分开）
   meters.json          # 表计台账（名称/位置/量程）
-tests/                 # test_restore / test_proration / test_validation / test_api
+tests/                 # test_restore / test_proration / test_validation / test_alignment / test_publish / test_api
 ```
 
 样例数据里刻意埋了：1 次换表（EM-02 2025-09-15）、1 次满量程回绕（EM-03 2025-12-17）、
@@ -109,6 +126,7 @@ tests/                 # test_restore / test_proration / test_validation / test_
 ## 已知限制
 
 - 换表记录的拆表/装表读数需由人工签认后登记，系统不做 OCR 或现场采集。
+- 两路来源对齐只按「同表 + 同电量类型 + 日期容差 + 读数精度」合并；若现场抄表与采集的读数系统性偏差（例如 CT 倍率不同），需要先修正采集口径，系统不会自动折算。
 - 回绕判定依赖量程配置（默认 99999.9）；量程配错会把真实回绕判成异常，或反之。
 - 缺口期间没有读数，系统不做任何插值；缺口越大，该月日均值参考意义越小。
 - 表计倍率（CT 变比）在台账里只登记不参与换算（样例倍率均为 1.0）。
